@@ -11,6 +11,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { buildBranchFits, buildLoopWidths, deriveDefaultTrends, type RatingFitResult } from '@/types/rating'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
@@ -38,7 +39,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    // 绳套宽度随导出一并输出：由当前点据两支拟合值按同水位流量差生成
+    loopWidths: buildLoopWidths(buildBranchFits(ratings))
   }
 }
 
@@ -56,6 +59,12 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
+  // 旧版本备份的点据缺涨落标识：导入前先按相邻测次水位补默认态势
+  const trendPatches = deriveDefaultTrends(obj.ratings ?? [])
+  const ratings = (obj.ratings ?? []).map((rating) => {
+    const patch = trendPatches.get(rating.id)
+    return patch ? { ...rating, trend: patch.trend, trendSource: patch.trendSource } : rating
+  })
   const payload: BackupPayload = {
     app: 'gbhydrogaug',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
@@ -64,8 +73,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     sections: obj.sections ?? [],
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
-    ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    ratings,
+    compares: obj.compares ?? [],
+    loopWidths: Array.isArray(obj.loopWidths) ? obj.loopWidths : []
   }
   return { ok: true, errors, payload }
 }
@@ -170,7 +180,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
 }
 
 /**
- * 生成结论文本：按测站输出最新水位、断面测次、定线参数与超限点据。
+ * 生成结论文本：按测站输出最新水位、断面测次、分支定线参数、绳套宽度与超限点据。
  * 供导出页的「检测结论」区域使用。
  */
 export interface ConclusionLine {
@@ -184,9 +194,27 @@ export interface ConclusionLine {
   fitText: string
 }
 
+function branchFitText(
+  stationId: string,
+  lineNo: string,
+  fits: RatingFitResult[],
+  widthText: string
+): string {
+  const branches = fits
+    .filter((fit) => fit.stationId === stationId && fit.lineNo === lineNo)
+    .sort((a, b) => (a.trend === b.trend ? 0 : a.trend === '涨水' ? -1 : 1))
+  const parts = branches.map((fit) => {
+    if (!fit.valid) return `${fit.trend}支未定线（${fit.sampleCount} 点）`
+    return `${fit.trend}支 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+  })
+  if (parts.length === 0) return `${lineNo} 线暂无点据`
+  return `${lineNo} 线 ${parts.join('；')}${widthText}`
+}
+
 export function buildConclusionLines(
   payload: BackupPayload,
-  fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
+  fits: RatingFitResult[],
+  loopWidths = buildLoopWidths(fits)
 ): ConclusionLine[] {
   return payload.stations.map((station) => {
     const sections = payload.sections.filter((section) => section.stationId === station.id)
@@ -201,9 +229,14 @@ export function buildConclusionLines(
     ).length
     const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
     const fitParts = lines.map((lineNo) => {
-      const fit = fits.find((item) => item.lineNo === lineNo)
-      if (!fit || !fit.valid) return `${lineNo} 线未定线`
-      return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      const widths = loopWidths.filter((item) => item.stationId === station.id && item.lineNo === lineNo)
+      let widthText = ''
+      if (widths.length > 0) {
+        const max = widths.reduce((acc, item) => (Math.abs(item.widthM3s) > Math.abs(acc.widthM3s) ? item : acc))
+        const meanAbs = widths.reduce((sum, item) => sum + Math.abs(item.widthM3s), 0) / widths.length
+        widthText = `；绳套宽 均 ${meanAbs.toFixed(1)} / 最大 ${Math.abs(max.widthM3s).toFixed(1)} m³/s（H=${max.stageM} m）`
+      }
+      return branchFitText(station.id, lineNo, fits, widthText)
     })
     return {
       stationId: station.id,

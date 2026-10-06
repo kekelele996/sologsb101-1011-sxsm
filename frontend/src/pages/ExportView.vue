@@ -32,7 +32,7 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
+import { buildBranchFits } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -71,15 +71,9 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
-      payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      lineNo
-    )
-  )
-  conclusions.value = buildConclusionLines(payload, fits)
+  // 按测站 × 涨落态势逐支拟合，检测结论展示两支成果与绳套宽度
+  const fits = buildBranchFits(payload.ratings)
+  conclusions.value = buildConclusionLines(payload, fits, payload.loopWidths ?? [])
 }
 
 async function handleExport(): Promise<void> {
@@ -168,7 +162,7 @@ onMounted(() => {
       <div>
         <h2 class="page__title">比测偏差分析与导出</h2>
         <p class="gb-hint">
-          按测站输出检测结论（测次数、最新水位、定线参数、超限点据），并可导出 / 导入全量 JSON 备份。
+          按测站输出检测结论（测次数、最新水位、涨/落两支定线参数、绳套宽度、超限点据），涨落标识与绳套宽度随 JSON 一并导出。
         </p>
       </div>
       <div class="page__actions">
@@ -253,6 +247,19 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="态势" width="86" align="center">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.trend"
+              size="small"
+              :type="row.trend === '涨水' ? 'success' : 'warning'"
+              effect="plain"
+            >
+              {{ row.trend }}
+            </el-tag>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
@@ -290,7 +297,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings（含涨落标识）/ compares 六张表及 loopWidths 绳套宽度
         </span>
       </div>
 

@@ -1,4 +1,4 @@
-import type { Rating } from './rating'
+import type { Rating, TrendLabel } from './rating'
 
 /** 比测判定结论 */
 export type CompareVerdict = '合格' | '超限'
@@ -44,4 +44,6 @@ export interface CompareRow {
   rating: Rating | null
   stationName: string
   lineNo: string
+  /** 所属支线态势（涨水支 / 落水支），点据已删除时为 null */
+  trend: TrendLabel | null
 }

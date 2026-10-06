@@ -128,6 +128,12 @@ body::before {
   fill: #8194a2;
 }
 
+.gb-chart-width {
+  font-size: 10px;
+  font-weight: 700;
+  fill: #b9770e;
+}
+
 @media (max-width: 900px) {
   .gb-panel {
     padding: 12px;
