@@ -32,7 +32,7 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
+import { fitPowerCurve, RISE_FALL_LABELS, type RiseFall } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -71,14 +71,18 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
-      payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      lineNo
+  const fits = ratingStore.lineNos.flatMap((lineNo) => {
+    const lineRatings = payload.ratings.filter((rating) => rating.lineNo === lineNo)
+    return (['rising', 'falling'] as RiseFall[]).map((riseFall) =>
+      fitPowerCurve(
+        lineRatings
+          .filter((rating) => rating.riseFall === riseFall)
+          .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+        lineNo,
+        riseFall
+      )
     )
-  )
+  })
   conclusions.value = buildConclusionLines(payload, fits)
 }
 
@@ -251,6 +255,19 @@ onMounted(() => {
         <el-table-column label="定线号" width="90" align="center">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="涨落" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.rating"
+              size="small"
+              :type="row.rating.riseFall === 'rising' ? 'warning' : 'primary'"
+              effect="plain"
+            >
+              {{ RISE_FALL_LABELS[row.rating.riseFall as RiseFall] }}
+            </el-tag>
+            <span v-else class="gb-hint">—</span>
           </template>
         </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">

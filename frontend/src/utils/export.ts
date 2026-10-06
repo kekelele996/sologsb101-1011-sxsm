@@ -11,6 +11,14 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import {
+  backfillRiseFall,
+  calcLoopWidth,
+  fitPowerCurve,
+  type LoopWidth,
+  type Rating,
+  type RiseFall
+} from '@/types/rating'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
@@ -19,7 +27,7 @@ export type BackupKey = (typeof BACKUP_KEYS)[number]
 /** 各表行数统计（导出页展示与导入结果回执共用） */
 export type CountMap = Record<BackupKey, number>
 
-/** 组装当前本地数据的完整快照 */
+/** 组装当前本地数据的完整快照（含涨落标识与绳套宽度派生成果） */
 export async function buildBackupPayload(): Promise<BackupPayload> {
   const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
     db.stations.toArray(),
@@ -38,8 +46,38 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    loopWidths: buildLoopWidths(ratings)
   }
+}
+
+/** 按定线号 + 涨落支拟合，计算各线绳套宽度（任一支不可定线则该线跳过） */
+export function buildLoopWidths(ratings: Rating[]): LoopWidth[] {
+  const byLine = new Map<string, Rating[]>()
+  ratings.forEach((rating) => {
+    const list = byLine.get(rating.lineNo) ?? []
+    list.push(rating)
+    byLine.set(rating.lineNo, list)
+  })
+  const result: LoopWidth[] = []
+  byLine.forEach((list, lineNo) => {
+    const stationId = list[0]?.stationId ?? ''
+    const rising = fitPowerCurve(
+      list.filter((rating) => rating.riseFall === 'rising').map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      lineNo,
+      'rising'
+    )
+    const falling = fitPowerCurve(
+      list.filter((rating) => rating.riseFall === 'falling').map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      lineNo,
+      'falling'
+    )
+    if (!rising.valid || !falling.valid) return
+    const stages = list.map((rating) => rating.stageM)
+    const loop = calcLoopWidth(lineNo, stationId, rising, falling, Math.min(...stages), Math.max(...stages))
+    if (loop) result.push(loop)
+  })
+  return result
 }
 
 /** 校验外部 JSON 是否为本站可识别的备份文件 */
@@ -65,7 +103,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    loopWidths: Array.isArray(obj.loopWidths) ? obj.loopWidths : []
   }
   return { ok: true, errors, payload }
 }
@@ -114,6 +153,8 @@ export function readFileText(file: File): Promise<string> {
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
+  // 旧备份可能缺涨落标识，导入时按相邻测次水位补默认
+  const ratings = backfillRiseFall(payload.ratings)
   await db.transaction(
     'rw',
     [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
@@ -122,7 +163,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.sections.bulkPut(payload.sections)
       await db.verticals.bulkPut(payload.verticals)
       await db.points.bulkPut(payload.points)
-      await db.ratings.bulkPut(payload.ratings)
+      await db.ratings.bulkPut(ratings)
       await db.compares.bulkPut(payload.compares)
     }
   )
@@ -186,7 +227,17 @@ export interface ConclusionLine {
 
 export function buildConclusionLines(
   payload: BackupPayload,
-  fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
+  fits: Array<{
+    lineNo: string
+    riseFall: RiseFall
+    valid: boolean
+    a: number
+    b: number
+    h0: number
+    meanResidualPct: number
+    sampleCount: number
+    message: string
+  }>
 ): ConclusionLine[] {
   return payload.stations.map((station) => {
     const sections = payload.sections.filter((section) => section.stationId === station.id)
@@ -201,9 +252,23 @@ export function buildConclusionLines(
     ).length
     const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
     const fitParts = lines.map((lineNo) => {
-      const fit = fits.find((item) => item.lineNo === lineNo)
-      if (!fit || !fit.valid) return `${lineNo} 线未定线`
-      return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
+      const lineRatings = ratings.filter((rating) => rating.lineNo === lineNo)
+      const rising = fits.find((item) => item.lineNo === lineNo && item.riseFall === 'rising')
+      const falling = fits.find((item) => item.lineNo === lineNo && item.riseFall === 'falling')
+      const parts: string[] = []
+      if (rising?.valid) {
+        parts.push(`涨水支 Q=${rising.a}·(H-${rising.h0})^${rising.b}（${rising.sampleCount} 点，残差 ${rising.meanResidualPct}%）`)
+      } else {
+        parts.push(`涨水支未定线（${rising?.message ?? '点据不足 3 个'}）`)
+      }
+      if (falling?.valid) {
+        parts.push(`落水支 Q=${falling.a}·(H-${falling.h0})^${falling.b}（${falling.sampleCount} 点，残差 ${falling.meanResidualPct}%）`)
+      } else {
+        parts.push(`落水支未定线（${falling?.message ?? '点据不足 3 个'}）`)
+      }
+      const loop = payload.loopWidths.find((item) => item.lineNo === lineNo)
+      if (loop) parts.push(`绳套宽度 ΔQ=${loop.widthM3s} m³/s（H=${loop.stageM} m）`)
+      return `${lineNo} 线：${parts.join('；')}`
     })
     return {
       stationId: station.id,

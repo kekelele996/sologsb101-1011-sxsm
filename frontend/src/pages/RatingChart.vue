@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
  * 模块 5：/ratings 水位流量关系点据与定线
- * 幂函数拟合 Q = a×(H-H0)^b、残差展示、超限点据挂红，并同步 URL query。
+ * 同一测站按涨落态势分成涨水支 / 落水支分别幂函数拟合 Q = a×(H-H0)^b，
+ * 关系曲线绘制两支并按绳套宽度标出同水位流量差，残差超限点据挂红并进入比测分析清单。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Edit, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
@@ -14,7 +15,14 @@ import DeviationTag from '@/components/common/DeviationTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
-import { fitPowerCurve, type Rating, type RatingFitResult } from '@/types/rating'
+import {
+  curveFlow,
+  RISE_FALL_LABELS,
+  suggestRiseFall,
+  type Rating,
+  type RatingFitResult,
+  type RiseFall
+} from '@/types/rating'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -25,38 +33,34 @@ const stationStore = useStationStore()
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
 const submitting = ref(false)
+/** 涨落态势是否被定线人员手动改过：改过之后不再自动刷新建议标识 */
+const riseFallTouched = ref(false)
 const form = reactive({
   stationId: '',
   stageM: 0,
   flowM3s: 0,
   lineNo: 'A',
+  riseFall: 'rising' as RiseFall,
+  riseFallManual: false,
   measureNo: '',
   measuredAt: new Date().toISOString().slice(0, 16)
 })
 
-const fit = computed(() => ratingStore.activeFit)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
+const branchFits = computed(() => ratingStore.activeBranchFits)
+const risingFit = computed(() => branchFits.value.rising)
+const fallingFit = computed(() => branchFits.value.falling)
 
-/** 当前定线号下的点据（含曲线流量与残差） */
+/** 当前定线号下的点据（含所属支线曲线流量与残差） */
 const pointRows = computed(() =>
-  ratingStore.ratings
-    .filter((rating) => rating.lineNo === ratingStore.activeLineNo)
-    .sort((a, b) => a.stageM - b.stageM)
-    .map((rating) => {
-      const predicted = fit.value.valid ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
-      const residualPct =
-        fit.value.valid && rating.flowM3s > 0
-          ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
-          : 0
-      const compare = ratingStore.compares.find((item) => item.ratingId === rating.id)
-      return {
-        rating,
-        stationName: ratingStore.stationNameOf(rating.stationId),
-        predicted,
-        residualPct,
-        verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
-      }
-    })
+  ratingStore.pointRows.map((row) => {
+    const compare = ratingStore.compares.find((item) => item.ratingId === row.rating.id)
+    return {
+      ...row,
+      stationName: ratingStore.stationNameOf(row.rating.stationId),
+      verdict: compare?.verdict ?? (Math.abs(row.residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
+    }
+  })
 )
 
 const filterModel = computed<FilterModel>(() => ({
@@ -66,11 +70,51 @@ const filterModel = computed<FilterModel>(() => ({
   verdicts: ratingStore.filter.verdicts
 }))
 
-/** 关系曲线坐标：横轴水位、纵轴流量 */
+/** 绳套宽度：同一水位两支曲线的流量差 */
+const loopWidth = computed(() => {
+  const rising = risingFit.value
+  const falling = fallingFit.value
+  const rows = pointRows.value
+  if (!rising?.valid || !falling?.valid || rows.length === 0) return null
+  const stages = rows.map((row) => row.rating.stageM)
+  const stageMin = Math.min(...stages)
+  const stageMax = Math.max(...stages)
+  const hStar = Number(((stageMin + stageMax) / 2).toFixed(2))
+  const qr = curveFlow(rising, hStar)
+  const qf = curveFlow(falling, hStar)
+  const width = Number(Math.abs(qr - qf).toFixed(1))
+  const avg = (qr + qf) / 2
+  return {
+    stageM: hStar,
+    risingFlow: qr,
+    fallingFlow: qf,
+    widthM3s: width,
+    widthPct: avg > 0 ? Number(((width / avg) * 100).toFixed(1)) : 0
+  }
+})
+
+/** 关系曲线坐标：横轴水位、纵轴流量；涨水支 / 落水支各一条曲线 */
 const chart = computed(() => {
   const rows = pointRows.value
   if (rows.length === 0) {
-    return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string }>, stageMin: 0, stageMax: 0, flowMax: 0 }
+    return {
+      risingSamples: '',
+      fallingSamples: '',
+      points: [] as Array<{ id: string; cx: number; cy: number; verdict: string; riseFall: RiseFall }>,
+      loop: null as null | {
+        x: number
+        yTop: number
+        yBottom: number
+        labelX: number
+        labelY: number
+        anchor: 'start' | 'end'
+        width: string
+        hStar: string
+      },
+      stageMin: 0,
+      stageMax: 0,
+      flowMax: 0
+    }
   }
   const stages = rows.map((row) => row.rating.stageM)
   const flows = rows.map((row) => row.rating.flowM3s)
@@ -85,27 +129,69 @@ const chart = computed(() => {
     stageMax - stageMin < 1e-6 ? (left + right) / 2 : left + ((stageM - stageMin) / (stageMax - stageMin)) * (right - left)
   const toY = (flowM3s: number): number => bottom - (flowM3s / flowMax) * (bottom - top)
   const sampleCount = 13
-  const samples = Array.from({ length: sampleCount }, (_, index) => {
-    const stageM = stageMin + ((stageMax - stageMin) * index) / (sampleCount - 1 || 1)
-    const value = fit.value.valid ? fit.value.a * Math.pow(Math.max(stageM - fit.value.h0, 1e-6), fit.value.b) : 0
-    return `${toX(stageM).toFixed(1)},${toY(value).toFixed(1)}`
-  }).join(' ')
+  const buildSamples = (fit: RatingFitResult | null): string => {
+    if (!fit?.valid) return ''
+    return Array.from({ length: sampleCount }, (_, index) => {
+      const stageM = stageMin + ((stageMax - stageMin) * index) / (sampleCount - 1 || 1)
+      const value = curveFlow(fit, stageM)
+      return `${toX(stageM).toFixed(1)},${toY(value).toFixed(1)}`
+    }).join(' ')
+  }
+  const rising = risingFit.value
+  const falling = fallingFit.value
+  let loop = null
+  if (rising?.valid && falling?.valid) {
+    const hStar = Number(((stageMin + stageMax) / 2).toFixed(2))
+    const qr = curveFlow(rising, hStar)
+    const qf = curveFlow(falling, hStar)
+    const x = toX(hStar)
+    const anchor: 'start' | 'end' = x > 285 ? 'end' : 'start'
+    loop = {
+      x,
+      yTop: toY(Math.max(qr, qf)),
+      yBottom: toY(Math.min(qr, qf)),
+      labelX: anchor === 'end' ? x - 8 : x + 8,
+      labelY: (toY(qr) + toY(qf)) / 2,
+      anchor,
+      width: Math.abs(qr - qf).toFixed(1),
+      hStar: hStar.toFixed(2)
+    }
+  }
   return {
-    samples,
+    risingSamples: buildSamples(rising),
+    fallingSamples: buildSamples(falling),
     points: rows.map((row) => ({
       id: row.rating.id,
       cx: toX(row.rating.stageM),
       cy: toY(row.rating.flowM3s),
-      verdict: row.verdict
+      verdict: row.verdict,
+      riseFall: row.rating.riseFall
     })),
+    loop,
     stageMin,
     stageMax,
     flowMax
   }
 })
 
+/** 表单内水位 / 时间改动后，未手动改定时按相邻测次水位自动刷新涨落标识 */
+function refreshSuggestion(): void {
+  if (riseFallTouched.value || form.riseFallManual) return
+  form.riseFall = suggestRiseFall(ratingStore.ratings, form.stationId, form.stageM, form.measuredAt)
+}
+
+/** 定线人员手动改定涨落态势：标记后不再随水位 / 时间变动自动刷新 */
+function markRiseFallManual(): void {
+  riseFallTouched.value = true
+  form.riseFallManual = true
+}
+
+watch(() => [form.stageM, form.measuredAt, form.stationId], refreshSuggestion)
+
 function openCreate(): void {
   editingId.value = null
+  riseFallTouched.value = false
+  form.riseFallManual = false
   form.stationId = stationStore.currentStationId ?? stationStore.stations[0]?.id ?? ''
   form.lineNo = ratingStore.activeLineNo
   const last = pointRows.value[pointRows.value.length - 1]
@@ -113,15 +199,19 @@ function openCreate(): void {
   form.flowM3s = last ? Number((last.rating.flowM3s * 1.2).toFixed(1)) : 50
   form.measureNo = `${new Date().getFullYear()}-${String(ratingStore.ratings.length + 1).padStart(3, '0')}`
   form.measuredAt = new Date().toISOString().slice(0, 16)
+  refreshSuggestion()
   dialogVisible.value = true
 }
 
 function openEdit(rating: Rating): void {
   editingId.value = rating.id
+  riseFallTouched.value = false
+  form.riseFallManual = rating.riseFallManual ?? false
   form.stationId = rating.stationId
   form.stageM = rating.stageM
   form.flowM3s = rating.flowM3s
   form.lineNo = rating.lineNo
+  form.riseFall = rating.riseFall
   form.measureNo = rating.measureNo
   form.measuredAt = rating.measuredAt.slice(0, 16)
   dialogVisible.value = true
@@ -147,6 +237,8 @@ async function submitForm(): Promise<void> {
       stageM: form.stageM,
       flowM3s: form.flowM3s,
       lineNo: form.lineNo.trim() || 'A',
+      riseFall: form.riseFall,
+      riseFallManual: form.riseFallManual,
       measureNo: form.measureNo.trim(),
       measuredAt: form.measuredAt ? new Date(form.measuredAt).toISOString() : new Date().toISOString()
     }
@@ -181,18 +273,25 @@ async function removeRating(rating: Rating): Promise<void> {
 }
 
 async function refit(): Promise<void> {
-  const result: RatingFitResult = fitPowerCurve(
-    pointRows.value.map((row) => ({ stageM: row.rating.stageM, flowM3s: row.rating.flowM3s })),
-    ratingStore.activeLineNo
-  )
-  ratingStore.setFit(result)
   const count = await ratingStore.rebuildCompares(ratingStore.activeLineNo)
-  if (result.valid) {
-    ElMessage.success(
-      `定线完成：Q = ${result.a}×(H-${result.h0})^${result.b}，平均残差 ${result.meanResidualPct}%，刷新比测 ${count} 条`
-    )
+  const { rising, falling } = branchFits.value
+  const parts: string[] = []
+  if (rising?.valid) {
+    parts.push(`涨水支 Q=${rising.a}×(H-${rising.h0})^${rising.b}，残差 ${rising.meanResidualPct}%`)
   } else {
-    ElMessage.warning(result.message || '当前点据不足以定线')
+    parts.push(`涨水支未定线：${rising?.message ?? '点据不足 3 个'}`)
+  }
+  if (falling?.valid) {
+    parts.push(`落水支 Q=${falling.a}×(H-${falling.h0})^${falling.b}，残差 ${falling.meanResidualPct}%`)
+  } else {
+    parts.push(`落水支未定线：${falling?.message ?? '点据不足 3 个'}`)
+  }
+  const loop = loopWidth.value
+  const loopText = loop ? `；绳套宽度 ΔQ=${loop.widthM3s} m³/s（H=${loop.stageM} m）` : ''
+  if (rising?.valid || falling?.valid) {
+    ElMessage.success(`定线完成：${parts.join('；')}${loopText}，刷新比测 ${count} 条`)
+  } else {
+    ElMessage.warning(parts.join('；'))
   }
 }
 
@@ -215,6 +314,17 @@ function handleFilterChange(): void {
 function handleReset(): void {
   ratingStore.resetFilter()
   void router.replace({ query: {} })
+}
+
+/** 点据颜色：超限挂红，否则按涨落支配色 */
+function pointColor(row: { verdict: string; riseFall: RiseFall }): string {
+  if (row.verdict === '超限') return '#c0392b'
+  return row.riseFall === 'rising' ? '#e67e22' : '#2980b9'
+}
+
+function pointStroke(row: { verdict: string; riseFall: RiseFall }): string {
+  if (row.verdict === '超限') return '#7b241c'
+  return row.riseFall === 'rising' ? '#b96408' : '#1a5276'
 }
 
 onMounted(() => {
@@ -241,7 +351,8 @@ onMounted(() => {
       <div>
         <h2 class="page__title">水位流量关系点据与定线</h2>
         <p class="gb-hint">
-          点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b，残差超过 {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单。
+          点据按定线号分组，并按涨落态势分成涨水支 / 落水支分别幂函数拟合 Q = a×(H-H0)^b；残差超过
+          {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单，比测曲线流量取所属支线拟合值。
         </p>
       </div>
       <div class="page__actions">
@@ -281,55 +392,78 @@ onMounted(() => {
     />
 
     <div class="gb-stats-row">
-      <StatBadge label="current 线点据" :value="pointRows.length" suffix="点" icon="DataLine" />
+      <StatBadge label="当前线点据" :value="pointRows.length" suffix="点" icon="DataLine" />
       <StatBadge
-        label="定线系数 a"
-        :value="fit.valid ? fit.a : '—'"
-        :suffix="fit.valid ? `b=${fit.b}` : '未定线'"
-        tone="info"
+        label="涨水支"
+        :value="risingFit?.valid ? `Q=${risingFit.a}·(H-${risingFit.h0})^${risingFit.b}` : '未定线'"
+        :suffix="risingFit?.valid ? `${risingFit.sampleCount} 点` : '不足 3 点'"
+        :tone="risingFit?.valid ? 'warning' : 'info'"
         icon="TrendCharts"
       />
       <StatBadge
-        label="平均残差"
-        :value="fit.valid ? fit.meanResidualPct : '—'"
-        suffix="%"
-        :tone="fit.valid && fit.meanResidualPct <= ratingStore.deviationLimitPct ? 'success' : 'warning'"
-        icon="Histogram"
+        label="落水支"
+        :value="fallingFit?.valid ? `Q=${fallingFit.a}·(H-${fallingFit.h0})^${fallingFit.b}` : '未定线'"
+        :suffix="fallingFit?.valid ? `${fallingFit.sampleCount} 点` : '不足 3 点'"
+        :tone="fallingFit?.valid ? 'info' : 'info'"
+        icon="TrendCharts"
       />
       <StatBadge
-        label="超限点据"
-        :value="pointRows.filter((row) => row.verdict === '超限').length"
-        suffix="点"
-        :tone="pointRows.some((row) => row.verdict === '超限') ? 'danger' : 'success'"
-        :icon="pointRows.some((row) => row.verdict === '超限') ? 'WarningFilled' : 'DataLine'"
+        label="绳套宽度"
+        :value="loopWidth ? `ΔQ=${loopWidth.widthM3s}` : '—'"
+        :suffix="loopWidth ? `m³/s · ${loopWidth.widthPct}%` : '两支未定线'"
+        :tone="loopWidth ? 'success' : 'info'"
+        icon="DataLine"
       />
     </div>
 
     <el-alert
-      v-if="!fit.valid"
+      v-if="pointRows.length === 0"
       type="warning"
       show-icon
       :closable="false"
-      :title="fit.message || '当前定线号下点据不足，至少需要 3 个实测点才能定线'"
+      title="当前定线号下点据不足，至少需要 3 个实测点才能定线"
     />
-    <el-alert
-      v-else
-      type="success"
-      show-icon
-      :closable="false"
-      :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
-    />
+    <template v-else>
+      <el-alert
+        v-if="risingFit && !risingFit.valid"
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="`涨水支未定线：${risingFit.message}`"
+      />
+      <el-alert
+        v-if="fallingFit && !fallingFit.valid"
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="`落水支未定线：${fallingFit.message}`"
+      />
+      <el-alert
+        v-if="risingFit?.valid && fallingFit?.valid"
+        type="success"
+        show-icon
+        :closable="false"
+        :title="`${ratingStore.activeLineNo} 线两支定线有效：涨水支 Q = ${risingFit.a} × (H - ${risingFit.h0})^${risingFit.b}（${risingFit.sampleCount} 点）；落水支 Q = ${fallingFit.a} × (H - ${fallingFit.h0})^${fallingFit.b}（${fallingFit.sampleCount} 点）；同水位绳套宽度 ΔQ = ${loopWidth?.widthM3s} m³/s（H = ${loopWidth?.stageM} m）`"
+      />
+    </template>
 
     <div class="page__grid">
       <EmptyPanel
         v-if="pointRows.length === 0"
         title="该定线号下还没有关系点据"
-        description="录入实测水位与流量点据后即可做幂函数定线；也可以先切换到其他定线号查看已有成果。"
+        description="录入实测水位与流量点据后即可按涨落支做幂函数定线；也可以先切换到其他定线号查看已有成果。"
         action-text="新增点据"
         @action="openCreate"
       />
 
       <el-table v-else :data="pointRows" border stripe class="gb-table-compact">
+        <el-table-column label="涨落" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.rating.riseFall === 'rising' ? 'warning' : 'primary'" effect="plain">
+              {{ RISE_FALL_LABELS[row.rating.riseFall as RiseFall] }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.stageM.toFixed(2) }}</span>
@@ -371,7 +505,7 @@ onMounted(() => {
 
       <el-card shadow="never" class="page__chart-card">
         <div class="gb-panel-title">
-          <h3>{{ ratingStore.activeLineNo }} 线关系曲线</h3>
+          <h3>{{ ratingStore.activeLineNo }} 线关系曲线（涨水支 / 落水支）</h3>
           <el-icon><TrendCharts /></el-icon>
         </div>
         <svg v-if="pointRows.length > 0" viewBox="0 0 360 220" class="page__chart">
@@ -381,19 +515,61 @@ onMounted(() => {
           <text x="14" y="194" class="gb-chart-axis">0</text>
           <text x="52" y="208" class="gb-chart-axis">{{ chart.stageMin.toFixed(2) }}</text>
           <text x="300" y="208" class="gb-chart-axis">{{ chart.stageMax.toFixed(2) }} m</text>
-          <polyline v-if="fit.valid" :points="chart.samples" fill="none" stroke="#0f4c75" stroke-width="2" />
+          <!-- 涨水支曲线 -->
+          <polyline v-if="risingFit?.valid" :points="chart.risingSamples" fill="none" stroke="#e67e22" stroke-width="2" />
+          <!-- 落水支曲线 -->
+          <polyline v-if="fallingFit?.valid" :points="chart.fallingSamples" fill="none" stroke="#2980b9" stroke-width="2" />
+          <!-- 绳套宽度：同一水位两支流量差 -->
+          <g v-if="chart.loop">
+            <line
+              :x1="chart.loop.x"
+              :y1="chart.loop.yTop"
+              :x2="chart.loop.x"
+              :y2="chart.loop.yBottom"
+              stroke="#7b241c"
+              stroke-width="1.4"
+              stroke-dasharray="4 3"
+            />
+            <line
+              :x1="chart.loop.x - 4"
+              :y1="chart.loop.yTop"
+              :x2="chart.loop.x + 4"
+              :y2="chart.loop.yTop"
+              stroke="#7b241c"
+              stroke-width="1.4"
+            />
+            <line
+              :x1="chart.loop.x - 4"
+              :y1="chart.loop.yBottom"
+              :x2="chart.loop.x + 4"
+              :y2="chart.loop.yBottom"
+              stroke="#7b241c"
+              stroke-width="1.4"
+            />
+            <text
+              :x="chart.loop.labelX"
+              :y="chart.loop.labelY"
+              class="gb-chart-loop"
+              :text-anchor="chart.loop.anchor"
+            >绳套宽度 ΔQ={{ chart.loop.width }} m³/s（H={{ chart.loop.hStar }}）</text>
+          </g>
           <circle
             v-for="point in chart.points"
             :key="point.id"
             :cx="point.cx"
             :cy="point.cy"
             r="4.5"
-            :fill="point.verdict === '超限' ? '#c0392b' : '#7fd1e8'"
-            :stroke="point.verdict === '超限' ? '#7b241c' : '#0f4c75'"
+            :fill="pointColor(point)"
+            :stroke="pointStroke(point)"
           />
         </svg>
         <EmptyPanel v-else title="暂无可绘制的点据" description="录入点据后自动生成关系曲线。" compact />
-        <p class="gb-hint">红点表示残差超限的点据，曲线为幂函数定线成果。</p>
+        <div class="page__legend">
+          <span class="page__legend-item"><i class="page__legend-line" style="background:#e67e22" />涨水支</span>
+          <span class="page__legend-item"><i class="page__legend-line" style="background:#2980b9" />落水支</span>
+          <span class="page__legend-item"><i class="page__legend-dot" style="background:#c0392b" />超限点据</span>
+        </div>
+        <p class="gb-hint">同水位下涨水支与落水支的流量差即绳套宽度，按两支曲线拟合值计算；红点表示残差超限的点据。</p>
       </el-card>
     </div>
 
@@ -406,6 +582,13 @@ onMounted(() => {
         </el-form-item>
         <el-form-item label="定线号" required>
           <el-input v-model="form.lineNo" placeholder="如 A / B / C" maxlength="8" />
+        </el-form-item>
+        <el-form-item label="涨落态势" required>
+          <el-radio-group v-model="form.riseFall" @change="markRiseFallManual">
+            <el-radio value="rising">涨水</el-radio>
+            <el-radio value="falling">落水</el-radio>
+          </el-radio-group>
+          <span class="gb-hint page__rise-hint">默认按相邻测次水位自动识别，定线人员可改定</span>
         </el-form-item>
         <el-form-item label="水位" required>
           <el-input-number v-model="form.stageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" />
@@ -477,6 +660,45 @@ onMounted(() => {
 .page__chart {
   width: 100%;
   height: 240px;
+}
+
+.gb-chart-loop {
+  font-size: 11px;
+  font-weight: 600;
+  fill: #7b241c;
+}
+
+.page__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 6px 0;
+  font-size: 12px;
+  color: #5d6d79;
+}
+
+.page__legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.page__legend-line {
+  display: inline-block;
+  width: 18px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.page__legend-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.page__rise-hint {
+  margin-left: 10px;
 }
 
 .page__unit {
